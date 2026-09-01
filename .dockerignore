@@ -1,0 +1,24 @@
+# Keep the build context small and free of anything secret or machine-local.
+.git
+.github
+.venv
+venv
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Never let credentials or the local journal reach the image.
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.sqlite*
+*.log
+
+docs/
+scripts/
