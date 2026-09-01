@@ -1,0 +1,103 @@
+# Proves the deployable artefact actually builds, and publishes it.
+#
+# Two jobs. `test` runs the suite on a clean machine, which catches the "works on
+# my laptop" class of failure. `image` builds the Docker image and pushes it to
+# the GitHub Container Registry, so what gets deployed is the same artefact CI
+# verified rather than a rebuild that might differ.
+#
+# No secrets are needed: the tests run offline against the mock LLM provider and
+# never touch a broker, and GITHUB_TOKEN is scoped to this repository.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run the suite
+        # mock keeps this hermetic: no key, no network, no cost.
+        env:
+          LLM_PROVIDER: mock
+        run: python -m pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci --prefix frontend
+
+      - name: Typecheck and build the console
+        run: npm run build --prefix frontend
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Only publish from a real push. A pull-request build still proves the
+          # Dockerfile compiles, without putting an unreviewed image on the
+          # registry.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        # The container must serve its health endpoint with no credentials at
+        # all. A deployment that only works once secrets are present hides
+        # configuration errors until the worst possible moment.
+        run: |
+          docker run -d --name desk -p 8000:8000 \
+            -e LLM_PROVIDER=mock -e PROPOSE_ONLY=true \
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/api/health; then
+              echo "health OK"
+              break
+            fi
+            sleep 2
+          done
+          echo
+          echo "--- console served on the same origin ---"
+          curl -sf -o /dev/null -w "GET / -> HTTP %{http_code}\n" http://127.0.0.1:8000/
+          echo "--- status endpoint ---"
+          curl -sf http://127.0.0.1:8000/api/status | head -c 400
+          echo
+          docker logs desk | tail -20
+          docker rm -f desk
