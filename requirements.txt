@@ -1,13 +1,18 @@
-fastapi==0.141.1
-uvicorn[standard]==0.34.0
-httpx==0.28.1
-pydantic==2.10.4
-pydantic-settings==2.7.0
+# Pinned from a resolved, working environment. Regenerate by installing
+# unpinned and freezing, never by hand-editing a single version: the last
+# hand edit produced a set that resolved locally and was unsatisfiable on a
+# clean machine, which CI caught and a laptop never would.
+
+fastapi==0.141.1  # API + SSE
+uvicorn[standard]==0.34.0  # ASGI server
+httpx==0.28.1  # async HTTP to Alpaca and the LLM
+pydantic==2.13.5
+pydantic-settings==2.7.0  # typed settings with validation
 numpy==2.2.1
-scipy==1.15.0
+scipy==1.15.0  # Brent root-finding for implied volatility
 python-dotenv==1.0.1
-sse-starlette==2.2.1
+sse-starlette==3.4.8  # live agent activity stream
+mcp==2.1.1  # client for Alpaca's official MCP server
 pytest==8.3.4
 pytest-asyncio==0.25.2
-respx==0.22.0
-mcp==2.1.1
+respx==0.22.0  # httpx mocking in tests
