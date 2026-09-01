@@ -1,0 +1,36 @@
+# --- Secrets: NEVER commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Data / runtime artefacts
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+*.log
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Tooling
+vendor/alpaca-cli/
+.DS_Store
+.idea/
+.vscode/
