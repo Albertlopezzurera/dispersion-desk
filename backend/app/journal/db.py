@@ -48,7 +48,9 @@ CREATE TABLE IF NOT EXISTS signals (
     realized_correlation  REAL,
     correlation_premium   REAL,
     direction             TEXT NOT NULL,
-    constituent_ivs       TEXT NOT NULL     -- JSON {symbol: iv}
+    constituent_ivs       TEXT NOT NULL,    -- JSON {symbol: iv}
+    evidence_verdict      TEXT,             -- proven | unproven | underpowered
+    evidence_scale        REAL              -- fraction of full size the verdict allows
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
@@ -63,7 +65,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     catalyst_verdicts TEXT,                 -- JSON list
     advocate_opinion  TEXT,                 -- JSON object
     memo              TEXT,
-    legs              TEXT NOT NULL         -- JSON list
+    legs              TEXT NOT NULL,        -- JSON list
+    spots             TEXT                  -- JSON {underlying: spot at decision}
 );
 
 CREATE TABLE IF NOT EXISTS risk_checks (
@@ -131,6 +134,27 @@ class Journal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS silently does nothing to an existing table,
+        so a journal written by an earlier version would keep working while
+        quietly missing the column, and the attribution would find no entry spot
+        to price against.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
+        if "spots" not in existing:
+            conn.execute("ALTER TABLE decisions ADD COLUMN spots TEXT")
+            logger.info("journal: added decisions.spots")
+
+        signal_cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
+        for column, kind in (("evidence_verdict", "TEXT"), ("evidence_scale", "REAL")):
+            if column not in signal_cols:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {kind}")
+                logger.info("journal: added signals.%s", column)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -179,8 +203,9 @@ class Journal:
             conn.execute(
                 """INSERT INTO signals (cycle_id, observed_at, index_symbol, index_iv,
                    basket_iv, dispersion_ratio, implied_correlation, realized_correlation,
-                   correlation_premium, direction, constituent_ivs)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   correlation_premium, direction, constituent_ivs,
+                   evidence_verdict, evidence_scale)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     cycle_id,
                     _now(),
@@ -193,6 +218,8 @@ class Journal:
                     signal.get("correlation_premium"),
                     signal["direction"],
                     json.dumps(signal.get("constituent_ivs", {})),
+                    signal.get("evidence_verdict"),
+                    signal.get("evidence_scale"),
                 ),
             )
 
@@ -200,8 +227,9 @@ class Journal:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO decisions (cycle_id, basket_id, decided_at, direction, approved,
-                   max_loss, rationale, catalyst_verdicts, advocate_opinion, memo, legs)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   max_loss, rationale, catalyst_verdicts, advocate_opinion, memo, legs,
+                   spots)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     cycle_id,
                     decision["basket_id"],
@@ -214,6 +242,7 @@ class Journal:
                     json.dumps(decision.get("advocate_opinion", {})),
                     decision.get("memo", ""),
                     json.dumps(decision.get("legs", [])),
+                    json.dumps(decision.get("spots", {})),
                 ),
             )
             conn.executemany(
@@ -297,6 +326,20 @@ class Journal:
             "SELECT * FROM attributions WHERE basket_id = ? ORDER BY id DESC", (basket_id,)
         )
         return decision
+
+    def executed_decisions(self, limit: int = 20) -> list[dict]:
+        """Approved baskets that actually reached the market.
+
+        An approval that never filled has nothing to attribute, so the monitor
+        works from orders rather than from decisions.
+        """
+        return self._rows(
+            """SELECT DISTINCT d.* FROM decisions d
+               JOIN orders o ON o.basket_id = d.basket_id
+               WHERE d.approved = 1 AND o.error IS NULL
+               ORDER BY d.id DESC LIMIT ?""",
+            (limit,),
+        )
 
     def rejected_decisions(self, limit: int = 50) -> list[dict]:
         """Refusals, for the Risk Center. The record that the gates actually bite."""

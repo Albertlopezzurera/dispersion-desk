@@ -23,8 +23,9 @@ every fifteen minutes is not finding opportunities -- it is finding noise.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -33,7 +34,10 @@ from app.alpaca.client import AlpacaClient, OptionQuote
 from app.config import ConfigError, Settings
 from app.execution.executor import Executor, build_basket
 from app.journal.db import Journal
-from app.quant import dispersion, realized, surface, universe
+from app.backtest.engine import build_observations
+from app.quant import dispersion, evidence, realized, surface, universe
+from app.quant.attribution import LegSnapshot, attribute_basket
+from app.quant.black_scholes import bs_greeks, implied_volatility
 from app.risk.engine import (
     CONTRACT_MULTIPLIER,
     PortfolioState,
@@ -48,6 +52,11 @@ logger = logging.getLogger(__name__)
 # Daily bars pulled for the realised-correlation estimate. Long enough to be
 # statistically meaningful, short enough to reflect the current regime.
 REALIZED_LOOKBACK_DAYS = 90
+
+# History pulled to assess whether the signal has proven predictive power.
+# Long, because after correcting for the overlap between rolling windows a
+# year of daily data is worth only a handful of independent samples.
+EVIDENCE_LOOKBACK_DAYS = 6 * 365
 
 # Strike window fetched around spot, as a fraction of spot. Wide enough to hold
 # the condor wings, narrow enough to keep the chain request small.
@@ -105,16 +114,43 @@ class Orchestrator:
 
         if option_positions:
             snapshots = await client.get_option_snapshots([p["symbol"] for p in option_positions])
+
+            # Spot prices for every underlying we hold, fetched once each.
+            underlyings = {s.underlying for s in snapshots.values()}
+            spots = dict(
+                zip(
+                    underlyings,
+                    await asyncio.gather(*(client.get_stock_price(u) for u in underlyings)),
+                )
+            )
+
+            today = datetime.now(timezone.utc).date()
             for pos in option_positions:
                 snap = snapshots.get(pos["symbol"])
                 if snap is None:
                     continue
                 scale = float(pos.get("qty") or 0) * CONTRACT_MULTIPLIER
+
+                # The free `indicative` feed returns only latestQuote: no greeks,
+                # no implied volatility. Reading them off the snapshot silently
+                # produced a book that measured as delta 0 and vega 0 no matter
+                # what was actually held, which would make every post-trade greek
+                # limit meaningless. So the desk solves them itself, from the
+                # same mid it would trade on.
+                leg = self._position_greeks(snap, spots.get(snap.underlying), today)
+                if leg is None:
+                    logger.warning(
+                        "cannot value %s: no spot or unsolvable IV; greek limits "
+                        "will understate the book",
+                        pos["symbol"],
+                    )
+                    continue
+
                 greeks = greeks + PositionGreeks(
-                    delta=(snap.delta or 0.0) * scale,
-                    gamma=(snap.gamma or 0.0) * scale,
-                    vega=(snap.vega or 0.0) * scale,
-                    theta=(snap.theta or 0.0) * scale,
+                    delta=leg.delta * scale,
+                    gamma=leg.gamma * scale,
+                    vega=leg.vega * scale,
+                    theta=leg.theta * scale,
                 )
                 # Long options risk the premium paid; short options are only ever
                 # opened inside a defined-risk structure, so cost basis is a
@@ -152,6 +188,19 @@ class Orchestrator:
                 strike_gte=spot * (1 - CHAIN_STRIKE_WINDOW),
                 strike_lte=spot * (1 + CHAIN_STRIKE_WINDOW),
             )
+            # Open interest is not in the snapshot on the free feed, so it is
+            # fetched separately and merged in. Without this the liquidity gate
+            # evaluates None for every contract and refuses everything.
+            oi = await client.get_open_interest(
+                symbol,
+                expiration_gte=today + timedelta(days=s.target_dte_min),
+                expiration_lte=today + timedelta(days=s.target_dte_max),
+            )
+            if oi:
+                chain = [
+                    replace(q, open_interest=oi.get(q.symbol, q.open_interest)) for q in chain
+                ]
+
             atm = surface.atm_volatility(
                 symbol, chain, spot, today, s.target_dte_min, s.target_dte_max, s.risk_free_rate
             )
@@ -162,6 +211,61 @@ class Orchestrator:
             {sym: atm for sym, atm, _ in results if atm is not None},
             {sym: chain for sym, _, chain in results},
         )
+
+    def _position_greeks(self, snap, spot, today):
+        """Greeks for one held contract, solved from its own quoted mid.
+
+        Returns ``None`` when the contract cannot be valued, which the caller
+        logs rather than silently treating as zero risk.
+        """
+        mid = snap.mid
+        if not spot or mid is None:
+            return None
+
+        t = surface.year_fraction(today, snap.expiration)
+        if t <= 0:
+            return None
+
+        iv = implied_volatility(
+            mid, spot, snap.strike, t, self.settings.risk_free_rate, 0.0, snap.option_type
+        )
+        if iv is None:
+            return None
+
+        return bs_greeks(
+            spot, snap.strike, t, self.settings.risk_free_rate, iv, 0.0, snap.option_type
+        )
+
+    async def _assess_evidence(self, client, names, weights):
+        """Has this signal ever been shown to predict anything?
+
+        Returns ``None`` when the history is too short to ask the question,
+        which the caller treats as "unknown" rather than as a pass.
+        """
+        try:
+            today = datetime.now(timezone.utc).date()
+            start = (today - timedelta(days=EVIDENCE_LOOKBACK_DAYS)).isoformat()
+            bars = await asyncio.gather(
+                *(client.get_stock_bars(n, start, today.isoformat()) for n in names),
+                client.get_stock_bars(self.settings.index_symbol, start, today.isoformat()),
+            )
+            closes = {n: [b["c"] for b in series] for n, series in zip(names, bars[:-1])}
+            closes[self.settings.index_symbol] = [b["c"] for b in bars[-1]]
+            dates = [today] * min(len(v) for v in closes.values())
+
+            observations = build_observations(
+                dates, closes, self.settings.index_symbol, weights, lookback=60, horizon=10
+            )
+            rows = [o for o in observations if o.forward_dispersion_ratio is not None]
+            if len(rows) < 30:
+                return None
+            return evidence.assess(
+                [o.dispersion_ratio for o in rows],
+                [o.forward_dispersion_ratio - o.dispersion_ratio for o in rows],
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence is advisory, never fatal
+            logger.warning("evidence assessment unavailable: %s", exc)
+            return None
 
     def _record_rejection(
         self, cycle_id: int, proposal, direction: str, verdicts, reason: str, check_name: str
@@ -191,6 +295,138 @@ class Orchestrator:
         )
 
     # --- the cycle ---------------------------------------------------------
+
+    async def monitor_positions(self) -> list[dict]:
+        """Mark every executed basket and decompose its P&L by greek.
+
+        This is where the desk's claim gets checked against reality. The
+        strategy says its profits come from vega; the attribution says where
+        they actually came from. A basket showing delta as its dominant driver
+        is not a lucky win, it is a hedge that is not working.
+
+        Runs against live quotes, so it reflects the book as it stands rather
+        than as it was modelled.
+        """
+        results: list[dict] = []
+        decisions = self.journal.executed_decisions()
+        if not decisions:
+            return results
+
+        async with AlpacaClient(self.settings) as client:
+            today = datetime.now(timezone.utc).date()
+            positions = {p["symbol"]: p for p in await client.get_positions()}
+
+            for decision in decisions:
+                try:
+                    legs = json.loads(decision.get("legs") or "[]")
+                    spots = json.loads(decision.get("spots") or "{}")
+                except json.JSONDecodeError:
+                    continue
+
+                # Only legs still held can be marked; a closed leg has already
+                # had its outcome recorded.
+                held = [leg for leg in legs if leg.get("symbol") in positions]
+                if not held or not spots:
+                    continue
+
+                snapshots = await client.get_option_snapshots([leg["symbol"] for leg in held])
+                underlyings = {leg["underlying"] for leg in held}
+                current_spots = dict(
+                    zip(
+                        underlyings,
+                        await asyncio.gather(*(client.get_stock_price(u) for u in underlyings)),
+                    )
+                )
+
+                pairs = []
+                for leg in held:
+                    snap = snapshots.get(leg["symbol"])
+                    entry_spot = spots.get(leg["underlying"])
+                    exit_spot = current_spots.get(leg["underlying"])
+                    if snap is None or not entry_spot or not exit_spot:
+                        continue
+
+                    mid = snap.mid
+                    if mid is None:
+                        continue
+
+                    t_exit = surface.year_fraction(today, snap.expiration)
+                    if t_exit <= 0:
+                        continue
+                    # Time elapsed since the decision, recovered from the leg's
+                    # own recorded expiry distance.
+                    t_entry = t_exit + (
+                        (datetime.now(timezone.utc) - datetime.fromisoformat(
+                            decision["decided_at"]
+                        )).days / 365.0
+                    )
+
+                    exit_iv = implied_volatility(
+                        mid,
+                        exit_spot,
+                        snap.strike,
+                        t_exit,
+                        self.settings.risk_free_rate,
+                        0.0,
+                        snap.option_type,
+                    )
+                    if exit_iv is None:
+                        continue
+
+                    signed = int(float(positions[leg["symbol"]].get("qty") or 0))
+                    if signed == 0:
+                        continue
+
+                    entry = LegSnapshot(
+                        symbol=leg["symbol"],
+                        option_type=snap.option_type,
+                        signed_contracts=signed,
+                        spot=entry_spot,
+                        strike=snap.strike,
+                        time_to_expiry=t_entry,
+                        implied_volatility=leg["implied_volatility"],
+                        price=leg["price"],
+                        risk_free_rate=self.settings.risk_free_rate,
+                    )
+                    exit_ = LegSnapshot(
+                        symbol=leg["symbol"],
+                        option_type=snap.option_type,
+                        signed_contracts=signed,
+                        spot=exit_spot,
+                        strike=snap.strike,
+                        time_to_expiry=t_exit,
+                        implied_volatility=exit_iv,
+                        price=mid,
+                        risk_free_rate=self.settings.risk_free_rate,
+                    )
+                    pairs.append((entry, exit_, None))
+
+                if not pairs:
+                    continue
+
+                attribution = attribute_basket(pairs)
+                payload = {
+                    "total": attribution.total,
+                    "delta_pnl": attribution.delta_pnl,
+                    "gamma_pnl": attribution.gamma_pnl,
+                    "vega_pnl": attribution.vega_pnl,
+                    "theta_pnl": attribution.theta_pnl,
+                    "slippage": attribution.slippage,
+                    "residual": attribution.residual,
+                    "dominant": attribution.dominant_driver,
+                }
+                self.journal.record_attribution(decision["basket_id"], payload)
+                self._log(
+                    None,
+                    "attribution",
+                    f"{decision['basket_id']}: {attribution.total:+,.2f} "
+                    f"driven by {attribution.dominant_driver} "
+                    f"(vega {attribution.vega_pnl:+,.2f}, delta {attribution.delta_pnl:+,.2f}, "
+                    f"theta {attribution.theta_pnl:+,.2f})",
+                )
+                results.append({"basket_id": decision["basket_id"], **payload})
+
+        return results
 
     async def run_cycle(self) -> CycleResult:
         """Execute one full pass. Never raises: failures become journal entries."""
@@ -305,6 +541,24 @@ class Orchestrator:
                 direction = "neutral"
             signal_row["direction"] = direction
 
+            # --- evidence -------------------------------------------------
+            # Before acting on the signal, ask whether this signal has ever been
+            # shown to work. The answer scales the position; it does not merely
+            # decorate the report.
+            report = await self._assess_evidence(client, names, weights)
+            if report is not None:
+                signal_row["evidence_verdict"] = report.verdict
+                signal_row["evidence_scale"] = evidence.position_scale(report)
+                self._log(
+                    cycle_id,
+                    "evidence",
+                    f"{report.verdict.upper()} | {report.n_independent} independent samples "
+                    f"({report.inflation_factor:.0f}x inflation) | hit {report.hit_rate:.1%} "
+                    f"vs naive {report.naive_hit_rate:.1%} | p={report.p_value:.3f} "
+                    f"-> position scale {evidence.position_scale(report):.0%}",
+                    "info" if report.is_significant else "warning",
+                )
+
             self._log(
                 cycle_id,
                 "signal",
@@ -324,6 +578,10 @@ class Orchestrator:
                 return CycleResult(cycle_id, "no_signal", msg, signal=signal_row)
 
             # --- build -----------------------------------------------------
+            # The evidence verdict sizes the trade. An unproven signal is not
+            # forbidden, it is capped -- refusing outright would mean never
+            # gathering the data that settles the question.
+            scale = float(signal_row.get("evidence_scale", 0.25))
             built = build_basket(
                 direction,
                 index_atm,
@@ -332,6 +590,7 @@ class Orchestrator:
                 chains,
                 today,
                 s,
+                size_scale=scale,
             )
             if built is None:
                 msg = "Signal present but no tradable defined-risk structure could be built."
@@ -409,6 +668,13 @@ class Orchestrator:
                         "advocate_opinion": opinion.__dict__,
                         "memo": memo,
                         "legs": [leg.__dict__ for leg in proposal.legs],
+                        # Entry spot per underlying: without it the attribution
+                        # has no reference point to price the delta effect
+                        # against when the position is marked later.
+                        "spots": {
+                            sym: atm.spot
+                            for sym, atm in ({s.index_symbol: index_atm} | vols).items()
+                        },
                         "checks": [
                             {
                                 "name": c.name,

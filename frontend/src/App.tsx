@@ -12,7 +12,10 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const API = "http://127.0.0.1:8000";
+// Empty string means same-origin, which is how the deployed build talks to
+// the API it is served from. In development Vite runs on a different port,
+// so VITE_API_BASE points at the local backend.
+const API = import.meta.env.VITE_API_BASE ?? "";
 
 type Tab = "dashboard" | "activity" | "decisions" | "risk";
 
@@ -52,6 +55,26 @@ interface Activity {
   step: string;
   level: string;
   message: string;
+}
+
+interface Signal {
+  observed_at: string;
+  index_symbol: string;
+  index_iv: number;
+  basket_iv: number;
+  dispersion_ratio: number;
+  implied_correlation: number | null;
+  realized_correlation: number | null;
+  correlation_premium: number | null;
+  direction: string;
+  constituent_ivs: Record<string, number>;
+}
+
+interface Evidence {
+  available: boolean;
+  verdict: string | null;
+  position_scale: number | null;
+  correlation_premium: number | null;
 }
 
 interface Decision {
@@ -127,6 +150,177 @@ function Stat({
   );
 }
 
+/**
+ * The first thing a visitor reads. Someone who has never heard of dispersion
+ * trading should understand what this desk does before scrolling.
+ */
+function Explainer() {
+  return (
+    <section className="hero">
+      <p className="hero-lead">
+        Most trading agents bet on <em>direction</em> &mdash; will this go up or down? Over a
+        few sessions that is close to a coin flip, and a profitable run proves nothing:
+        luck and skill look identical.
+      </p>
+      <p className="hero-lead">
+        This desk bets on <strong>correlation</strong> instead, and then proves where its
+        profits came from.
+      </p>
+      <ol className="hero-steps">
+        <li>
+          <b>Measure</b>
+          <span>
+            An index volatility is its constituents volatility damped by how much they move
+            together. The desk reads both from live option chains.
+          </span>
+        </li>
+        <li>
+          <b>Compare</b>
+          <span>
+            Implied correlation, what options price, against realised correlation, what the
+            stocks actually did. The gap is the edge.
+          </span>
+        </li>
+        <li>
+          <b>Prove</b>
+          <span>
+            Every closed trade is split by greek. If the profit came from delta rather than
+            vega, the desk did not earn it the way it claims &mdash; a bug, not a result.
+          </span>
+        </li>
+      </ol>
+    </section>
+  );
+}
+
+/**
+ * Whether the signal the desk trades has ever been shown to work.
+ *
+ * This panel exists because the first honest measurement of this strategy
+ * disagreed with the flattering one, and the disagreement mattered more than
+ * the strategy did.
+ */
+function EvidencePanel({ report }: { report: Evidence | null }) {
+  if (!report?.available || !report.verdict) {
+    return null;
+  }
+
+  const verdict = report.verdict.toLowerCase();
+  const tone = verdict === "proven" ? "ok" : verdict === "underpowered" ? "warn" : "bad";
+  const scale = report.position_scale ?? 1;
+
+  const explanation: Record<string, string> = {
+    proven:
+      "The signal beats a coin flip on independent samples. It may size a full position.",
+    unproven:
+      "On observations spaced far enough apart to be independent, the signal does not beat a coin flip. The desk still trades it, but small: refusing outright would mean never gathering the data that settles the question.",
+    underpowered:
+      "There are too few independent samples to conclude anything either way. This is absence of evidence, not evidence of absence, so the position is capped rather than abandoned.",
+  };
+
+  return (
+    <section className="panel evidence">
+      <h2>Is this signal proven?</h2>
+      <div className="evidence-head">
+        <span className={`verdict ${tone}`}>{report.verdict.toUpperCase()}</span>
+        <span className="mono scale">position capped at {(scale * 100).toFixed(0)}%</span>
+      </div>
+      <p className="muted">{explanation[verdict] ?? ""}</p>
+      <p className="muted small">
+        The signal is computed over a rolling 60-day window, so neighbouring observations
+        share 59 of their 60 days. Scoring every one of them counts the same few market
+        events repeatedly. Measured on real data the dispersion ratio only decorrelates
+        after about a month, so a year of daily observations is worth roughly a dozen
+        independent samples &mdash; and every confidence interval has to be widened
+        accordingly. The verdict above uses the corrected number.
+      </p>
+    </section>
+  );
+}
+
+/** The live dispersion signal: the core of the strategy, made visible. */
+function SignalPanel({ signal, entry }: { signal: Signal | null; entry: number }) {
+  if (!signal) {
+    return (
+      <section className="panel">
+        <h2>Dispersion signal</h2>
+        <p className="muted">
+          No signal recorded yet. Run a cycle while the US market is open and the desk will
+          read the option chains and compute one.
+        </p>
+      </section>
+    );
+  }
+
+  const premium = signal.correlation_premium;
+  const actionable = premium !== null && Math.abs(premium) >= entry;
+  // Position inside the [-entry, +entry] band, clamped so an extreme reading
+  // pins to the edge instead of overflowing the track.
+  const pos =
+    premium === null ? 50 : Math.max(2, Math.min(98, 50 + (premium / (entry * 2)) * 100));
+
+  return (
+    <section className="panel">
+      <h2>Dispersion signal</h2>
+      <div className="signal-grid">
+        <div>
+          <span>Implied correlation</span>
+          <b className="mono">
+            {signal.implied_correlation !== null ? signal.implied_correlation.toFixed(3) : "--"}
+          </b>
+          <small>what options price</small>
+        </div>
+        <div>
+          <span>Realised correlation</span>
+          <b className="mono">
+            {signal.realized_correlation !== null ? signal.realized_correlation.toFixed(3) : "--"}
+          </b>
+          <small>what stocks did, 90d</small>
+        </div>
+        <div>
+          <span>Premium</span>
+          <b className={"mono " + (actionable ? "warn" : "ok")}>
+            {premium !== null ? signed(premium, 3) : "--"}
+          </b>
+          <small>implied minus realised</small>
+        </div>
+        <div>
+          <span>{signal.index_symbol} implied vol</span>
+          <b className="mono">{(signal.index_iv * 100).toFixed(1)}%</b>
+          <small>at the money</small>
+        </div>
+        <div>
+          <span>Basket implied vol</span>
+          <b className="mono">{(signal.basket_iv * 100).toFixed(1)}%</b>
+          <small>weighted average</small>
+        </div>
+        <div>
+          <span>Verdict</span>
+          <b className={actionable ? "warn" : "ok"}>{signal.direction.replace(/_/g, " ")}</b>
+          <small>{actionable ? "outside the band" : "inside the band"}</small>
+        </div>
+      </div>
+
+      <div className="band">
+        <div className="band-track">
+          <div className="band-neutral" />
+          <div className="band-marker" style={{ left: pos + "%" }} />
+        </div>
+        <div className="band-labels mono">
+          <span>-{entry.toFixed(2)}</span>
+          <span>neutral &mdash; no trade</span>
+          <span>+{entry.toFixed(2)}</span>
+        </div>
+      </div>
+
+      <p className="muted small">
+        The desk acts only when the premium leaves the band. Most of the time it does not,
+        and declining to trade is the correct outcome rather than a failure.
+      </p>
+    </section>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [status, setStatus] = useState<Status | null>(null);
@@ -137,6 +331,8 @@ export default function App() {
   const [risk, setRisk] = useState<{ rejected: Decision[]; limits: Record<string, number> } | null>(
     null,
   );
+  const [signal, setSignal] = useState<Signal | null>(null);
+  const [evidenceReport, setEvidence] = useState<Evidence | null>(null);
   const [selected, setSelected] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState("");
@@ -157,6 +353,9 @@ export default function App() {
     try {
       setDecisions(await getJSON<Decision[]>("/api/decisions"));
       setRisk(await getJSON("/api/risk"));
+      const history = await getJSON<Signal[]>("/api/signals?limit=1");
+      setSignal(history[0] ?? null);
+      setEvidence(await getJSON<Evidence>("/api/evidence"));
     } catch {
       /* an empty journal on first run is not an error */
     }
@@ -276,7 +475,10 @@ export default function App() {
       <main>
         {tab === "dashboard" && (
           <>
-            {dashError && <div className="alert">{dashError}</div>}
+            <Explainer />
+            {dashError && !dashError.includes("credentials") && (
+              <div className="alert">{dashError}</div>
+            )}
             <section className="stats">
               <Stat label="Portfolio value" value={dash ? money(dash.net_asset_value) : "--"} />
               <Stat
@@ -307,6 +509,10 @@ export default function App() {
                 sub={dash ? `${dash.open_defined_risk_pct.toFixed(2)}% of NAV` : undefined}
               />
             </section>
+
+            <SignalPanel signal={signal} entry={status?.correlation_premium_entry ?? 0.12} />
+
+            <EvidencePanel report={evidenceReport} />
 
             <section className="panel">
               <h2>Risk envelope</h2>

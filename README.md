@@ -154,7 +154,8 @@ This invariant is proven over 4,000 randomised portfolios in
 
 | Purpose | Endpoint |
 |---|---|
-| Option chain with greeks + IV | `GET /v1beta1/options/snapshots/{underlying}` |
+| Option chain (quotes) | `GET /v1beta1/options/snapshots/{underlying}` |
+| Open interest | `GET /v2/options/contracts` |
 | Contract snapshots | `GET /v1beta1/options/snapshots?symbols=…` |
 | Underlying spot / daily bars | `GET /v2/stocks/…` |
 | News (Catalyst agent) | `GET /v1beta1/news` |
@@ -164,6 +165,98 @@ This invariant is proven over 4,000 randomised portfolios in
 Alpaca's **MCP server** is configured for interactive research and strategy inspection
 (`ALPACA_TOOLSETS=account,trading,options-data,news`); the autonomous loop uses the
 Trading API directly so it can run headless under cron or a service manager.
+
+## Does the signal actually work? The answer changed the project
+
+The first honest measurement looked excellent: **85.7%** directional hit rate
+out-of-sample on four years of real prices. It was wrong, and how it was wrong became the
+point of the whole system.
+
+The signal uses a rolling 60-day window, so consecutive observations share 59 of their 60
+days. On real data the dispersion ratio has an autocorrelation of **0.977 at one day** and
+does not fall below 0.2 until about **24 days** out. So 366 "observations" are worth
+roughly **16 independent samples**. Scoring a hit rate across all 366 inflates the
+apparent sample size about twenty-fold, and with it every confidence interval.
+
+Corrected, on six years of real Alpaca data:
+
+| segment | independent samples | hit rate | naive hit rate | p-value | verdict |
+|---|---|---|---|---|---|
+| train | 24 (30x inflation) | — | — | 0.006 | proven |
+| validation | 9 (40x) | 87.5% | 65.0% | 0.035 | **underpowered** |
+| out-of-sample | 12 (30x) | 66.7% | 68.8% | 0.194 | **unproven** |
+
+Note validation: p = 0.035 clears the conventional 5% bar, and the gate still refuses it,
+because a p-value computed on nine samples is not worth having.
+
+The same number, three ways, depending on parameters nobody should be able to tune after
+the fact: 85.7% (lookback 40, horizon 21), 68.8% (lookback 60, naive), 66.7% (lookback 60,
+independent). Only the last one is honest.
+
+### What the desk does about it
+
+`backend/app/quant/evidence.py` runs this test continuously, and the verdict **sizes the
+position**:
+
+| verdict | position | reasoning |
+|---|---|---|
+| proven | 100% | the signal beats a coin flip on independent samples |
+| unproven | 10% | it does not, so it trades small rather than not at all |
+| underpowered | 25% | too few samples to conclude; refusing outright would mean never learning |
+
+This is visible in live logs. On a real cycle the gate cut a basket's worst case from
+**$4,722 to $872**, which is what brought it inside the 1.5%-of-NAV per-trade limit. The
+finding is not a footnote in a report; it governs what the agent is allowed to do.
+
+### What is deliberately not reported
+
+A P&L backtest. It would need a historical *implied* volatility surface, which Alpaca does
+not serve. Substituting realised volatility fails for a checkable reason: with a 60-day
+estimation window and a 10-day holding period the entry and exit windows overlap by ~83%,
+so the measurable move is damped to near zero while costs are not. The engine is in the
+repository and runs under `--include-modelled-pnl`; its output is not presented as
+evidence, because making it look good would only require assuming lower costs.
+
+```bash
+python scripts/backtest.py --years 6
+```
+
+### Bugs this process found
+
+Four, none of which a unit test would have caught, all found by running against the live
+market:
+
+1. `buy_index_vol` was unreachable — the defined-risk rule rejected every short-name leg,
+   so the signal fired and the basket was always abandoned. Fixed by using iron condors
+   rather than sold strangles on the short side.
+2. The evidence gate computed a position scale that nothing applied.
+3. The free feed returns no open interest, so the liquidity gate rejected 100% of
+   contracts while appearing to work.
+4. The free feed returns no greeks, so the book measured as delta 0 and vega 0 regardless
+   of what was held.
+
+## Deployment
+
+The image serves the API and the console together, so the demo has one URL.
+
+```bash
+docker build -t dispersion-desk .
+```
+
+Then run it, passing credentials as environment variables (never baked into the image):
+
+```bash
+docker run -p 8000:8000 --env-file .env dispersion-desk
+```
+
+For a hosted deployment, `render.yaml` is a Render blueprint: point Render at the
+repository and it provisions the service, prompting once for the secrets and storing them
+encrypted. A deployed instance runs with `PROPOSE_ONLY=true`, so it analyses and proposes
+but does not submit orders until that is deliberately changed. A public URL that places
+trades the moment someone loads it is not a demo.
+
+Render's free plan has no persistent disk, so the decision journal resets on redeploy;
+uncomment the `disk:` block in the blueprint on a paid plan to keep the audit trail.
 
 ## Quick start
 
@@ -264,12 +357,16 @@ backend/app/
     attribution.py      greek P&L decomposition
     universe.py         basket and index weights
   agents/analysts.py    Catalyst, Devil's Advocate, Narrator + LLM client
+  backtest/engine.py    chronological splits, metrics, signal test
   risk/engine.py        deterministic gates; the only authoriser
   execution/executor.py structure construction and MLEG submission
   journal/db.py         append-only SQLite decision journal
   orchestrator.py       the autonomous cycle
   main.py               FastAPI + SSE
 frontend/src/App.tsx    operator console
+scripts/backtest.py     backtest runner
+Dockerfile              single image: API + console
+render.yaml             Render blueprint
 ```
 
 ## Disclosures

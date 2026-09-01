@@ -15,18 +15,24 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.alpaca.client import AlpacaClient
 from app.config import ConfigError, get_settings
 from app.journal.db import Journal
 from app.orchestrator import Orchestrator
 from app.quant import universe
+
+# Where the built console lands. Serving it from the API gives the demo a
+# single public URL, and removes the cross-origin hop entirely in production.
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +273,47 @@ async def run_cycle() -> dict[str, Any]:
     }
 
 
+@app.post("/api/monitor/run")
+async def run_monitor() -> dict[str, Any]:
+    """Mark every open basket and decompose its P&L by greek.
+
+    Separate from the trading cycle on purpose: marking a book is safe and can
+    be run at any time, while a cycle may place orders.
+    """
+    try:
+        return {"attributions": await orchestrator.monitor_positions()}
+    except ConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("monitor failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/evidence")
+async def evidence_status() -> dict[str, Any]:
+    """The signal's own statistical standing, from the most recent cycle.
+
+    The desk publishes this whether or not it flatters the strategy: a signal
+    that has not been shown to work is reported as unproven, and the position
+    scale it earns is shown alongside.
+    """
+    rows = journal.signal_history(1)
+    if not rows:
+        return {"available": False}
+
+    latest = rows[0]
+    return {
+        "available": True,
+        "observed_at": latest.get("observed_at"),
+        "verdict": latest.get("evidence_verdict"),
+        "position_scale": latest.get("evidence_scale"),
+        "dispersion_ratio": latest.get("dispersion_ratio"),
+        "implied_correlation": latest.get("implied_correlation"),
+        "realized_correlation": latest.get("realized_correlation"),
+        "correlation_premium": latest.get("correlation_premium"),
+    }
+
+
 @app.post("/api/agent/start")
 async def start_agent() -> dict[str, Any]:
     global _loop_task
@@ -304,3 +351,23 @@ async def kill_switch(engaged: bool = True) -> dict[str, Any]:
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# Mounted after every /api route so API paths always take precedence.
+if FRONTEND_DIST.is_dir():
+    app.mount(
+        "/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets"
+    )
+
+    @app.get("/{full_path:path}")
+    async def serve_console(full_path: str) -> FileResponse:
+        """Serve the console, falling back to index.html for client routes."""
+        candidate = FRONTEND_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")
+else:
+    logger.warning(
+        "No frontend build at %s; API-only mode. Run: npm run build --prefix frontend",
+        FRONTEND_DIST,
+    )

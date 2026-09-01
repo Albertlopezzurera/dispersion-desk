@@ -77,14 +77,20 @@ def log_returns(closes: list[float]) -> list[float]:
     return out
 
 
-def realized_volatility(closes: list[float]) -> float | None:
+def realized_volatility(closes: list[float], min_returns: int = MIN_RETURNS) -> float | None:
     """Annualised realised volatility from daily closes.
 
     Returns ``None`` when there are too few observations, rather than a number
     computed from a handful of points that would look equally authoritative.
+
+    ``min_returns`` exists for one legitimate case: *measuring* a realised
+    outcome over a short forward window, as the backtester does. An estimate
+    that feeds a trading decision must keep the strict default -- sizing a
+    position off ten noisy returns is how a strategy convinces itself it has an
+    edge it does not have.
     """
     returns = log_returns(closes)
-    if len(returns) < MIN_RETURNS:
+    if len(returns) < max(2, min_returns):
         return None
 
     daily = statistics.stdev(returns)
@@ -93,11 +99,13 @@ def realized_volatility(closes: list[float]) -> float | None:
     return daily * math.sqrt(TRADING_DAYS_PER_YEAR)
 
 
-def pairwise_correlation(a: list[float], b: list[float]) -> float | None:
+def pairwise_correlation(
+    a: list[float], b: list[float], min_returns: int = MIN_RETURNS
+) -> float | None:
     """Pearson correlation of two aligned return series."""
     if len(a) != len(b):
         raise RealizedError(f"return series must be the same length, got {len(a)} and {len(b)}")
-    if len(a) < MIN_RETURNS:
+    if len(a) < max(2, min_returns):
         return None
 
     try:
@@ -109,7 +117,9 @@ def pairwise_correlation(a: list[float], b: list[float]) -> float | None:
 
 
 def average_pairwise_correlation(
-    returns: dict[str, list[float]], weights: dict[str, float]
+    returns: dict[str, list[float]],
+    weights: dict[str, float],
+    min_returns: int = MIN_RETURNS,
 ) -> float | None:
     """Weighted average pairwise correlation across the basket.
 
@@ -127,7 +137,7 @@ def average_pairwise_correlation(
 
     for i, sym_i in enumerate(symbols):
         for sym_j in symbols[i + 1 :]:
-            rho = pairwise_correlation(returns[sym_i], returns[sym_j])
+            rho = pairwise_correlation(returns[sym_i], returns[sym_j], min_returns)
             if rho is None:
                 continue
             pair_weight = weights[sym_i] * weights[sym_j]

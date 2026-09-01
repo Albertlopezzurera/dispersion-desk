@@ -412,6 +412,60 @@ class AlpacaClient:
         )
         return quotes
 
+    async def get_open_interest(
+        self,
+        underlying: str,
+        expiration_gte: date | None = None,
+        expiration_lte: date | None = None,
+        max_pages: int = 10,
+    ) -> dict[str, int]:
+        """Open interest per contract, keyed by OCC symbol.
+
+        This lives on the *trading* API rather than the market-data snapshot, and
+        the distinction is not academic: on the free ``indicative`` feed a
+        snapshot returns only ``latestQuote`` -- no greeks, no implied
+        volatility, and no open interest. Gating on a field that endpoint never
+        populates would reject every contract forever while looking like a
+        working liquidity check.
+
+        Open interest is also stale by construction; it is published once a day,
+        after the close. It is a filter for "does anyone hold this contract",
+        never a live measure of what is currently trading.
+        """
+        out: dict[str, int] = {}
+        page_token: str | None = None
+
+        for _ in range(max_pages):
+            params: dict[str, Any] = {
+                "underlying_symbols": underlying,
+                "limit": 10000,
+                "status": "active",
+            }
+            if expiration_gte:
+                params["expiration_date_gte"] = expiration_gte.isoformat()
+            if expiration_lte:
+                params["expiration_date_lte"] = expiration_lte.isoformat()
+            if page_token:
+                params["page_token"] = page_token
+
+            payload = await self._request(
+                "GET", f"{self.trading_host}/v2/options/contracts", params=params
+            )
+            for contract in payload.get("option_contracts") or []:
+                symbol = contract.get("symbol")
+                raw = contract.get("open_interest")
+                if symbol and raw is not None:
+                    try:
+                        out[symbol] = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
+
+        return out
+
     async def get_option_snapshots(self, symbols: list[str]) -> dict[str, OptionQuote]:
         """Refresh specific contracts, chunked to Alpaca's 100-symbol limit."""
         out: dict[str, OptionQuote] = {}

@@ -81,20 +81,46 @@ def expected_move(spot: float, iv: float, t_years: float) -> float:
     return spot * iv * (t_years**0.5)
 
 
-def _nearest(quotes: list[OptionQuote], target_strike: float, kind: str, expiry: date):
-    """The tradable contract closest to a target strike.
+def _nearest(
+    quotes: list[OptionQuote],
+    target_strike: float,
+    kind: str,
+    expiry: date,
+    settings: Settings | None = None,
+):
+    """The closest *tradable* contract to a target strike.
 
-    Contracts without a two-sided market are filtered out here rather than at
-    the risk gate, because a structure built around an unquotable leg cannot be
-    priced at all.
+    Liquidity is filtered here, not left to the risk gate. The distinction
+    matters: the gate exists to refuse a bad trade, while this is about not
+    proposing one in the first place. A structure built around a contract nobody
+    quotes cannot be priced, cannot be filled, and wastes the whole cycle.
+
+    In practice this is what moves the strikes. A one-sigma wing on a 50%-vol
+    name lands on contracts with no open interest, so the builder walks inward
+    until it finds strikes that actually trade. Relaxing the gates instead would
+    have produced a trade on paper and nothing in the market.
+
+    Falls back to the nearest quotable contract when nothing meets the liquidity
+    bar, so the risk engine still sees the proposal and can reject it with a
+    reason the operator can read.
     """
     candidates = [
-        q
-        for q in quotes
-        if q.option_type == kind and q.expiration == expiry and q.mid is not None
+        q for q in quotes if q.option_type == kind and q.expiration == expiry and q.mid is not None
     ]
     if not candidates:
         return None
+
+    if settings is not None:
+        liquid = [
+            q
+            for q in candidates
+            if (q.open_interest or 0) >= settings.min_open_interest
+            and (q.spread_pct_of_mid is not None)
+            and q.spread_pct_of_mid <= settings.max_spread_pct_of_mid
+        ]
+        if liquid:
+            candidates = liquid
+
     return min(candidates, key=lambda q: abs(q.strike - target_strike))
 
 
@@ -125,8 +151,17 @@ def build_index_condor(
     risk_free_rate: float,
     short_side: bool,
     quantity: int = 1,
+    size_scale: float = 1.0,
+    settings: Settings | None = None,
 ) -> Structure | None:
-    """Iron condor on the index. ``short_side`` sells volatility, else buys it."""
+    """Iron condor. ``short_side`` sells volatility, else buys it.
+
+    ``size_scale`` narrows the wings. One contract is already the minimum
+    tradable quantity, so the only remaining lever on a condor's worst case is
+    how far the protective wing sits from the short strike: half the width is
+    half the maximum loss. This is how the evidence gate actually shrinks a
+    position rather than merely commenting on it.
+    """
     t = year_fraction(today, atm.expiration)
     if t <= 0:
         return None
@@ -135,13 +170,16 @@ def build_index_condor(
     if move <= 0:
         return None
 
-    put_short = _nearest(chain, atm.spot - SHORT_STRIKE_MOVES * move, "put", atm.expiration)
+    put_short = _nearest(chain, atm.spot - SHORT_STRIKE_MOVES * move, "put", atm.expiration, settings)
+    # Floor the wing so the strikes cannot collapse onto the short leg, which
+    # would leave a structure with no protection at all.
+    wing = max(0.15, WING_WIDTH_MOVES * max(0.0, min(1.0, size_scale)))
     put_wing = _nearest(
-        chain, atm.spot - (SHORT_STRIKE_MOVES + WING_WIDTH_MOVES) * move, "put", atm.expiration
+        chain, atm.spot - (SHORT_STRIKE_MOVES + wing) * move, "put", atm.expiration, settings
     )
-    call_short = _nearest(chain, atm.spot + SHORT_STRIKE_MOVES * move, "call", atm.expiration)
+    call_short = _nearest(chain, atm.spot + SHORT_STRIKE_MOVES * move, "call", atm.expiration, settings)
     call_wing = _nearest(
-        chain, atm.spot + (SHORT_STRIKE_MOVES + WING_WIDTH_MOVES) * move, "call", atm.expiration
+        chain, atm.spot + (SHORT_STRIKE_MOVES + wing) * move, "call", atm.expiration, settings
     )
 
     picked = [put_wing, put_short, call_short, call_wing]
@@ -197,8 +235,15 @@ def build_name_strangle(
     risk_free_rate: float,
     long_side: bool,
     quantity: int = 1,
+    size_scale: float = 1.0,
+    settings: Settings | None = None,
 ) -> Structure | None:
-    """Strangle on a constituent. Long buys its volatility, short sells it."""
+    """One constituent leg of the dispersion basket.
+
+    Long volatility is a bought strangle: the premium paid is the whole risk.
+    Short volatility is an iron condor rather than a sold strangle, because the
+    desk never opens a position whose loss is unbounded.
+    """
     t = year_fraction(today, atm.expiration)
     if t <= 0:
         return None
@@ -207,23 +252,29 @@ def build_name_strangle(
     if move <= 0:
         return None
 
-    put = _nearest(chain, atm.spot - STRANGLE_MOVES * move, "put", atm.expiration)
-    call = _nearest(chain, atm.spot + STRANGLE_MOVES * move, "call", atm.expiration)
+    put = _nearest(chain, atm.spot - STRANGLE_MOVES * move, "put", atm.expiration, settings)
+    call = _nearest(chain, atm.spot + STRANGLE_MOVES * move, "call", atm.expiration, settings)
     if put is None or call is None:
         return None
 
-    side = "buy" if long_side else "sell"
+    if not long_side:
+        # Selling a name's volatility with a naked strangle has unbounded loss,
+        # which this desk does not trade. The same view expressed as an iron
+        # condor is bounded by the wing width, so the short side of a dispersion
+        # trade is built the same way on a constituent as on the index.
+        #
+        # Without this the `buy_index_vol` direction was unreachable: the signal
+        # would fire, the builder would refuse every name, and the basket would
+        # be abandoned. Found by running a live cycle, not by a unit test.
+        return build_index_condor(
+            atm, chain, today, risk_free_rate, True, quantity, size_scale, settings
+        )
+
     legs = [
-        _to_leg(put, side, quantity, atm.spot, t, risk_free_rate, atm.implied_volatility),
-        _to_leg(call, side, quantity, atm.spot, t, risk_free_rate, atm.implied_volatility),
+        _to_leg(put, "buy", quantity, atm.spot, t, risk_free_rate, atm.implied_volatility),
+        _to_leg(call, "buy", quantity, atm.spot, t, risk_free_rate, atm.implied_volatility),
     ]
     net = sum((leg.price if leg.side == "buy" else -leg.price) for leg in legs)
-
-    if not long_side:
-        # A naked short strangle has unbounded loss. The desk does not trade
-        # undefined risk, so this branch refuses rather than sizing it.
-        logger.info("%s: short strangle rejected; undefined risk is not tradable", atm.underlying)
-        return None
 
     max_loss = net * quantity * CONTRACT_MULTIPLIER
     if max_loss <= 0:
@@ -247,6 +298,7 @@ def build_basket(
     today: date,
     settings: Settings,
     max_names: int = 2,
+    size_scale: float = 1.0,
 ) -> tuple[BasketProposal, list[Structure]] | None:
     """Assemble the full dispersion basket.
 
@@ -261,7 +313,9 @@ def build_basket(
     selling_index = direction == "sell_index_vol"
     r = settings.risk_free_rate
 
-    condor = build_index_condor(index_atm, index_chain, today, r, short_side=selling_index)
+    condor = build_index_condor(
+        index_atm, index_chain, today, r, selling_index, 1, size_scale, settings
+    )
     if condor is None:
         return None
 
@@ -280,7 +334,9 @@ def build_basket(
         chain = name_chains.get(symbol)
         if not chain:
             continue
-        strangle = build_name_strangle(atm, chain, today, r, long_side=selling_index)
+        strangle = build_name_strangle(
+            atm, chain, today, r, selling_index, 1, size_scale, settings
+        )
         if strangle is not None:
             structures.append(strangle)
 

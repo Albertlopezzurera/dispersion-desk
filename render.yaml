@@ -1,0 +1,74 @@
+# Render blueprint: one Docker service serving both the API and the console.
+#
+# To deploy: push this repo, then in Render choose "New > Blueprint" and point it
+# at the repository. Render reads this file and provisions everything below.
+#
+# Secrets are declared with `sync: false`, which means Render prompts for them
+# once and stores them encrypted. They are never written into the repository,
+# the image, or this file.
+
+services:
+  - type: web
+    name: dispersion-desk
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: frankfurt
+    healthCheckPath: /api/health
+
+    # A disk keeps the decision journal across deploys. Without one the audit
+    # trail resets on every release, which defeats the point of journalling
+    # refusals in the first place.
+    #
+    # Render's free plan does not include disks: on free, leave this commented
+    # out and accept that history resets on redeploy.
+    # disk:
+    #   name: journal
+    #   mountPath: /app/data
+    #   sizeGB: 1
+
+    envVars:
+      # --- Alpaca (paper only) ------------------------------------------
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_ACCOUNT_ID
+        sync: false
+
+      # Fixed rather than prompted: this project is built and tested for paper
+      # trading, and the client refuses to run against a live account.
+      - key: ALPACA_PAPER_TRADE
+        value: "true"
+      - key: ALPACA_OPTIONS_FEED
+        value: indicative
+
+      # --- Safety -------------------------------------------------------
+      # A deployed instance analyses and proposes but does not submit orders
+      # until this is deliberately flipped in the Render dashboard. A public URL
+      # that places trades the moment someone loads it is not a demo, it is an
+      # accident waiting to happen.
+      - key: PROPOSE_ONLY
+        value: "true"
+      - key: KILL_SWITCH
+        value: "false"
+
+      # --- LLM ----------------------------------------------------------
+      # "mock" runs the full pipeline deterministically, with no key and no cost.
+      # Set to "featherless" and supply the key to enable the real agents.
+      - key: LLM_PROVIDER
+        value: mock
+      - key: FEATHERLESS_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.featherless.ai/v1
+      - key: LLM_MODEL
+        value: Qwen/Qwen2.5-7B-Instruct
+
+      # --- Runtime ------------------------------------------------------
+      - key: DATABASE_URL
+        value: sqlite:///./data/dispersion_desk.db
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CYCLE_INTERVAL_SECONDS
+        value: "900"

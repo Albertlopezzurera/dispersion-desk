@@ -140,3 +140,71 @@ tbody tr:hover { background: var(--panel-2); }
 .attr-driver { grid-column: 1 / -1; color: var(--muted); font-size: 12px;
   border-top: 1px solid var(--line); padding-top: 8px; }
 .attr-driver b { color: var(--accent); font-family: inherit; }
+
+/* --- First screen: explain the desk before showing its numbers ----------- */
+.hero {
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 20px 22px;
+  margin-bottom: 16px;
+}
+.hero-lead { margin: 0 0 10px; font-size: 14px; max-width: 80ch; }
+.hero-lead em { color: var(--muted); font-style: normal; }
+.hero-lead strong { color: var(--accent); }
+.hero-steps {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 14px; margin: 16px 0 0; padding: 0; list-style: none; counter-reset: step;
+}
+.hero-steps li { counter-increment: step; border-top: 1px solid var(--line); padding-top: 10px; }
+.hero-steps li::before {
+  content: counter(step); color: var(--accent);
+  font: 600 11px var(--mono); display: block; margin-bottom: 4px;
+}
+.hero-steps b { display: block; font-size: 13px; margin-bottom: 4px; }
+.hero-steps span { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+
+/* --- Live dispersion signal ---------------------------------------------- */
+.signal-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px;
+}
+.signal-grid > div { display: flex; flex-direction: column; gap: 2px; }
+.signal-grid span {
+  color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.signal-grid b { font-size: 19px; }
+.signal-grid small { color: var(--muted); font-size: 11px; }
+
+.band { margin-top: 20px; }
+.band-track {
+  position: relative; height: 10px; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 5px;
+}
+.band-neutral {
+  position: absolute; left: 25%; right: 25%; top: 0; bottom: 0;
+  background: rgba(63, 185, 80, 0.18); border-left: 1px solid var(--ok);
+  border-right: 1px solid var(--ok);
+}
+.band-marker {
+  position: absolute; top: -4px; width: 3px; height: 18px;
+  background: var(--accent); border-radius: 2px; transform: translateX(-50%);
+  transition: left 0.4s ease;
+}
+.band-labels {
+  display: flex; justify-content: space-between;
+  margin-top: 8px; color: var(--muted); font-size: 11px;
+}
+
+/* --- Evidence: the signal's own statistical standing ---------------------- */
+.evidence { border-left: 3px solid var(--warn); }
+.evidence-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 10px; }
+.verdict {
+  font: 700 15px/1 var(--mono); letter-spacing: 0.08em;
+  padding: 7px 12px; border-radius: 5px; border: 1px solid currentColor;
+}
+.verdict.ok { color: var(--ok); }
+.verdict.warn { color: var(--warn); }
+.verdict.bad { color: var(--bad); }
+.evidence .scale { color: var(--muted); font-size: 12px; }
+.evidence p { max-width: 82ch; }
