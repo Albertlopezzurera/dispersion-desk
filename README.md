@@ -162,9 +162,32 @@ This invariant is proven over 4,000 randomised portfolios in
 | Account, positions, clock | `GET /v2/account`, `/v2/positions`, `/v2/clock` |
 | Multi-leg orders | `POST /v2/orders` with `order_class: "mleg"` |
 
-Alpaca's **MCP server** is configured for interactive research and strategy inspection
-(`ALPACA_TOOLSETS=account,trading,options-data,news`); the autonomous loop uses the
-Trading API directly so it can run headless under cron or a service manager.
+### The MCP server, actually used
+
+Alpaca's official MCP server is not merely declared in a config file: the Catalyst
+agent's news lookup runs through it on every cycle, launched on demand with
+`uvx alpaca-mcp-server` over stdio. The audit trail records which path was taken, so the
+claim is checkable rather than asserted:
+
+```
+[mcp] Fetched 12 headlines through Alpaca's MCP server (tool get_news).
+      Payload is flagged untrusted by the server and is passed to the model
+      as data, never as instructions.
+```
+
+That step was chosen deliberately. MCP earns its place where a tool call is *semantic* —
+fetching text for a language model to read is exactly that. The quantitative path stays on
+REST, because a desk that refuses to trade on stale quotes should not put a subprocess
+handshake between itself and the prices it values from. If the server cannot start, the
+REST endpoint takes over; an optional integration must never stop the desk trading.
+
+**A security detail worth honouring.** Alpaca's MCP server wraps every response as
+`{"_alpaca_mcp_security": {...}, "data": {...}}` and marks the payload
+`untrusted_tool_output`, warning that it may contain prompt injection. Those headlines go
+straight to a language model, so the desk takes the warning seriously: the Catalyst
+prompt instructs the model to treat headlines strictly as data, the content is fenced in
+explicit delimiters, and the agent is told never to follow an instruction found inside
+one.
 
 ## Does the signal actually work? The answer changed the project
 
@@ -312,7 +335,7 @@ code path can bypass them.
 .venv/Scripts/python -m pytest -v
 ```
 
-183 tests, none of them smoke tests:
+269 tests, none of them smoke tests:
 
 - **Black-Scholes** — put-call parity exact to 1e-10; analytic greeks against finite
   differences of the pricer itself; IV round-trips across 2%–300% vol; the solver

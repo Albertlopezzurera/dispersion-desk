@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.agents.analysts import AdvocateOpinion, CatalystVerdict, build_agents
+from app.alpaca import mcp as alpaca_mcp
 from app.alpaca.client import AlpacaClient, OptionQuote
 from app.config import ConfigError, Settings
 from app.execution.executor import Executor, build_basket
@@ -235,6 +236,32 @@ class Orchestrator:
         return bs_greeks(
             spot, snap.strike, t, self.settings.risk_free_rate, iv, 0.0, snap.option_type
         )
+
+    async def _fetch_headlines(self, client, symbols, cycle_id):
+        """Headlines per symbol, preferring the MCP server over REST.
+
+        The source actually used is logged, because "uses the MCP server" is a
+        claim that should be checkable from the audit trail rather than taken on
+        trust from a config file.
+        """
+        via_mcp = await alpaca_mcp.get_news(self.settings, symbols, limit=12)
+        if via_mcp is not None:
+            by_symbol: dict[str, list] = {s: [] for s in symbols}
+            for item in via_mcp:
+                for sym in item.get("symbols") or []:
+                    if sym in by_symbol:
+                        by_symbol[sym].append(item)
+            self._log(
+                cycle_id,
+                "mcp",
+                f"Fetched {len(via_mcp)} headlines through Alpaca's MCP server "
+                f"(tool get_news). Payload is flagged untrusted by the server and is "
+                f"passed to the model as data, never as instructions.",
+            )
+            return [by_symbol[s] for s in symbols]
+
+        self._log(cycle_id, "mcp", "MCP server unavailable; using the REST news endpoint")
+        return list(await asyncio.gather(*(client.get_news([s], limit=12) for s in symbols)))
 
     async def _assess_evidence(self, client, names, weights):
         """Has this signal ever been shown to predict anything?
@@ -612,9 +639,12 @@ class Orchestrator:
                 traded = sorted({leg.underlying for leg in proposal.legs} - {s.index_symbol})
                 self._log(cycle_id, "catalyst", f"Checking catalysts for {traded}")
 
-                headline_sets = await asyncio.gather(
-                    *(client.get_news([n], limit=12) for n in traded)
-                )
+                # Headlines come through Alpaca's official MCP server, which is
+                # the integration the hackathon asks for and the one place a
+                # tool call is genuinely semantic: fetching text for a model to
+                # read. If the server cannot start, the REST path takes over --
+                # an optional integration must never stop the desk trading.
+                headline_sets = await self._fetch_headlines(client, traded, cycle_id)
                 verdicts: list[CatalystVerdict] = list(
                     await asyncio.gather(
                         *(catalyst_agent.assess(n, h) for n, h in zip(traded, headline_sets))

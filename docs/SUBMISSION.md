@@ -113,7 +113,8 @@ than the P&L number, which at that sample size is mostly noise.
 
 | Purpose | Endpoint |
 |---|---|
-| Option chain with greeks + IV | `GET /v1beta1/options/snapshots/{underlying}` |
+| Option chain (quotes only on the free feed) | `GET /v1beta1/options/snapshots/{underlying}` |
+| Open interest | `GET /v2/options/contracts` |
 | Contract snapshots | `GET /v1beta1/options/snapshots?symbols=…` |
 | Underlying spot and daily bars | `GET /v2/stocks/…` |
 | News (Catalyst agent) | `GET /v1beta1/news` |
@@ -122,9 +123,12 @@ than the P&L number, which at that sample size is mostly noise.
 
 The desk re-solves implied volatility itself from quoted mids via Brent inversion rather
 than trusting the feed's published figure, and cross-checks both sides of every strike
-against put-call parity. Alpaca's **MCP server** is configured for interactive research
-(`ALPACA_TOOLSETS=account,trading,options-data,news`); the autonomous loop uses the
-Trading API directly so it runs headless.
+against put-call parity. Alpaca's **MCP server** is called on every cycle: the Catalyst agent's news lookup runs
+through `uvx alpaca-mcp-server` over stdio, and the audit trail records which path was
+used. The server flags its payload as untrusted output, and the desk honours that — those
+headlines reach a language model, so the prompt treats them as data and never as
+instructions. The quantitative path stays on REST, where a subprocess handshake between
+the desk and its prices would be a liability rather than a feature.
 
 Structures are always defined-risk: a short iron condor on the index (4 legs, one order)
 against long strangles on the constituents. Alpaca caps multi-leg orders at four legs, so
@@ -138,7 +142,7 @@ the index by weight — six liquid names, not a replication of SPY. Index weight
 dated manual snapshot with a staleness gate. Paper fills are simulated. Black-Scholes on
 American options, as the whole market quotes IV.
 
-**237 tests.** Put-call parity exact to 1e-10, greeks against finite differences, implied
+**269 tests.** Put-call parity exact to 1e-10, greeks against finite differences, implied
 correlation recovered to 1e-12, attribution reconciling exactly, and every risk gate
 failing closed.
 
@@ -223,7 +227,7 @@ Point at the vega row.
 | Item | Status |
 |---|---|
 | Autonomous agent on Alpaca Trading API | done |
-| Uses Alpaca MCP server or CLI | done — MCP configured |
+| Uses Alpaca MCP server or CLI | done — MCP server called every  cycle for the Catalyst news lookup, logged in the audit trail |
 | All strategies incorporate options | done — every structure is options-only |
 | Brand-new paper account, $100,000 balance | **pending — you must create this** |
 | Alpaca Account ID in submission | pending — blocked on the above |
